@@ -52,8 +52,11 @@ function Grid.new()
     self.rows           = 0
     self.flammableCount = 0
     self.ashCount       = 0
+    self.burningTiles   = {}   -- all currently burning tiles (maintained by igniteTile/ashTile)
+    self.waterSources   = {}   -- cached water tile centers, built once after loadMap
     self.smallFont      = love.graphics.newFont(8)
     self:loadMap()
+    self:buildWaterCache()
     return self
 end
 
@@ -127,12 +130,43 @@ function Grid:tileDistance(c1, r1, c2, r2)
     return math.max(math.abs(c2 - c1), math.abs(r2 - r1))
 end
 
+-- ── Water source cache ─────────────────────────────────────────────────────
+-- Built once after loadMap; O(1) lookup for NPCs.
+
+function Grid:buildWaterCache()
+    self.waterSources = {}
+    for row = 1, self.rows do
+        for col = 1, self.cols do
+            local tile = self.tiles[row][col]
+            if tile and tile.mat.isWater then
+                local cx, cy = self:tileCenter(col, row)
+                table.insert(self.waterSources, { x = cx, y = cy, col = col, row = row })
+            end
+        end
+    end
+end
+
+-- Returns the pixel center of the water source nearest to (x, y).
+function Grid:nearestWater(x, y)
+    local bestDist2 = math.huge
+    local bx, by   = x, y
+    for _, ws in ipairs(self.waterSources) do
+        local d2 = (ws.x - x)^2 + (ws.y - y)^2
+        if d2 < bestDist2 then
+            bestDist2 = d2
+            bx, by   = ws.x, ws.y
+        end
+    end
+    return bx, by
+end
+
 -- ── Burn state management ──────────────────────────────────────────────────
 
 function Grid:igniteTile(tile)
     if tile.burnState == BURN_STATE.INTACT and tile.mat.flammable then
         tile.burnState = BURN_STATE.BURNING
         tile.burnTimer = 0
+        table.insert(self.burningTiles, tile)
     end
 end
 
@@ -140,6 +174,13 @@ function Grid:ashTile(tile)
     if tile.burnState == BURN_STATE.BURNING then
         tile.burnState = BURN_STATE.ASH
         self.ashCount  = self.ashCount + 1
+        -- Remove from burningTiles list
+        for i = #self.burningTiles, 1, -1 do
+            if self.burningTiles[i] == tile then
+                table.remove(self.burningTiles, i)
+                break
+            end
+        end
     end
 end
 
@@ -191,28 +232,4 @@ function Grid:draw()
                 local dotS = 5
                 local dotG = 2
 
-                -- Level cap dots (top-left)
-                for i = 1, cap do
-                    local dx = px + 3 + (i - 1) * (dotS + dotG)
-                    local dy = py + 3
-                    love.graphics.setColor(0, 0, 0, 0.5)
-                    love.graphics.rectangle("fill", dx+1, dy+1, dotS, dotS)
-                    love.graphics.setColor(lcol)
-                    love.graphics.rectangle("fill", dx, dy, dotS, dotS)
-                end
-
-                -- Heat reward (bottom, centered)
-                love.graphics.setColor(0, 0, 0, 0.55)
-                love.graphics.printf("+" .. tile.mat.heat, px+1, py + TILE_H - 11, TILE_W, "center")
-                love.graphics.setColor(1, 1, 0.75, 0.95)
-                love.graphics.printf("+" .. tile.mat.heat, px, py + TILE_H - 12, TILE_W, "center")
-            end
-        end
-    end
-
-    love.graphics.setFont(prevFont)
-    love.graphics.setColor(1, 1, 1, 1)
-end
-
-return Grid
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+                -- Level cap dots 
