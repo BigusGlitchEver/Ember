@@ -232,4 +232,26 @@ function Grid:draw()
                 local dotS = 5
                 local dotG = 2
 
-                -- Level cap dots 
+                -- Level cap dots
+                for i = 1, cap do
+                    local dx = px + 3 + (i - 1) * (dotS + dotG)
+                    local dy = py + 3
+                    love.graphics.setColor(0, 0, 0, 0.5)
+                    love.graphics.rectangle("fill", dx+1, dy+1, dotS, dotS)
+                    love.graphics.setColor(lcol)
+                    love.graphics.rectangle("fill", dx, dy, dotS, dotS)
+                end
+
+                love.graphics.setColor(0, 0, 0, 0.55)
+                love.graphics.printf("+" .. tile.mat.heat, px+1, py + TILE_H - 11, TILE_W, "center")
+                love.graphics.setColor(1, 1, 0.75, 0.95)
+                love.graphics.printf("+" .. tile.mat.heat, px, py + TILE_H - 12, TILE_W, "center")
+            end
+        end
+    end
+
+    love.graphics.setFont(prevFont)
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+return Grid
