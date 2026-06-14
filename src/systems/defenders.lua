@@ -1,18 +1,33 @@
 -- defenders.lua
--- Spawns and manages NPCs (occupants, neighbors, fire department).
--- Reads fire position/level to make targeting and flee decisions.
--- Delegates per-NPC behavior to the NPC entity class.
+-- Orchestrates all defender spawning and escalation.
+--
+-- Responsibilities:
+--   • Spawn occupants immediately when a tile ignites
+--   • Spawn neighbors from nearby intact buildings after NEIGHBOR_DELAY
+--   • Detect bucket chains (3+ NPCs sharing a water source) and flag them
+--   • Spawn the fire truck after TRUCK_DELAY (shortened by burn%)
+--   • Update and cull all active NPCs and trucks
+--
+-- Does NOT own NPC or FireTruck behaviour — those live in their entity files.
 
-local NPC = require("src.entities.npc")
+local NPC       = require("src.entities.npc")
+local FireTruck = require("src.entities.firetruck")
 
--- ── Escalation timing ─────────────────────────────────────────────────────
-local NEIGHBOR_DELAY     = 10.0   -- seconds after ignition before neighbors respond
-local FIRETRUCK_DELAY    = 90.0   -- seconds before first truck (reduced at high burn%)
-local FIRETRUCK_DELAY_MIN = 30.0  -- minimum truck delay regardless of burn speed
-local BUCKET_CHAIN_COUNT = 3      -- NPCs near same water source to auto-chain
+-- ── Tuning constants ──────────────────────────────────────────────────────
+local NEIGHBOR_DELAY      = 8.0    -- seconds after ignition before neighbors respond
+local NEIGHBOR_RADIUS     = 3      -- tile Chebyshev radius for neighbor response
+local TRUCK_DELAY         = 60.0   -- seconds before first truck at 0% burned
+local TRUCK_DELAY_MIN     = 25.0   -- floor — truck always arrives eventually
+local CHAIN_THRESHOLD     = 3      -- NPCs sharing a water source to form a chain
+local NPC_CAP             = 28     -- max simultaneous NPCs
 
--- ── NPC cap ───────────────────────────────────────────────────────────────
-local NPC_CAP = 25
+-- ── Helpers ───────────────────────────────────────────────────────────────
+local function tileKey(col, row) return col .. "," .. row end
+
+-- Round pixel position to a coarse grid for water-source grouping
+local function waterKey(x, y)
+    return math.floor(x / 20) .. "," .. math.floor(y / 20)
+end
 
 -- ── Defenders ─────────────────────────────────────────────────────────────
 local Defenders = {}
@@ -20,64 +35,81 @@ Defenders.__index = Defenders
 
 function Defenders.new(grid, fire)
     local self = setmetatable({}, Defenders)
-    self.grid    = grid
-    self.fire    = fire
-    self.npcs    = {}       -- active NPC entities
-    self.trucks  = {}       -- fire trucks (future entity)
+    self.grid  = grid
+    self.fire  = fire
+    self.npcs  = {}
+    self.trucks = {}
 
-    -- Track which tiles have triggered occupant/neighbor spawns
-    self.spawnedOccupants = {}   -- tile key → true
-    self.neighborTriggered = {}  -- tile key → true
+    -- Per-tile spawn tracking
+    self.occupantSpawned  = {}   -- tileKey → true
+    self.neighborTimers   = {}   -- tileKey → countdown (seconds until neighbors spawn)
+    self.neighborSpawned  = {}   -- tileKey → true
 
-    self.runTimer         = 0
-    self.truckSpawned     = false
+    -- Truck state
+    self.truckSpawned = false
 
     return self
 end
 
--- ── Tile key ──────────────────────────────────────────────────────────────
-local function tileKey(col, row) return col .. "," .. row end
-
--- ── NPC spawning ──────────────────────────────────────────────────────────
+-- ── Occupant spawning ─────────────────────────────────────────────────────
+-- Called the first time a tile enters BURNING state.
 
 function Defenders:spawnOccupants(tile)
     local key = tileKey(tile.col, tile.row)
-    if self.spawnedOccupants[key] then return end
-    self.spawnedOccupants[key] = true
+    if self.occupantSpawned[key] then return end
+    self.occupantSpawned[key] = true
 
     local count = tile.occupants or 0
-    for i = 1, count do
+    for _ = 1, count do
         if #self.npcs < NPC_CAP then
             local cx, cy = self.grid:tileCenter(tile.col, tile.row)
-            local npc = NPC.new("occupant", cx, cy, self.grid, self.fire)
-            table.insert(self.npcs, npc)
+            table.insert(self.npcs, NPC.new("occupant", cx, cy, self.grid, self.fire))
         end
     end
 end
 
-function Defenders:spawnNeighbors(burningTile)
-    local key = tileKey(burningTile.col, burningTile.row)
-    if self.neighborTriggered[key] then return end
-    self.neighborTriggered[key] = true
+-- ── Neighbor spawn queue ──────────────────────────────────────────────────
+-- Each burning tile queues a neighbor wave that fires after NEIGHBOR_DELAY.
 
-    local radius = 3  -- neighbor response radius in tiles
+function Defenders:queueNeighbors(tile)
+    local key = tileKey(tile.col, tile.row)
+    if self.neighborTimers[key] or self.neighborSpawned[key] then return end
+    self.neighborTimers[key] = NEIGHBOR_DELAY
+end
+
+function Defenders:tickNeighborTimers(dt)
+    for key, timer in pairs(self.neighborTimers) do
+        if not self.neighborSpawned[key] then
+            self.neighborTimers[key] = timer - dt
+            if self.neighborTimers[key] <= 0 then
+                self.neighborSpawned[key] = true
+                -- Parse key back to col, row
+                local col, row = key:match("^(%d+),(%d+)$")
+                col, row = tonumber(col), tonumber(row)
+                if col and row then
+                    self:spawnNeighborsAround(col, row)
+                end
+            end
+        end
+    end
+end
+
+function Defenders:spawnNeighborsAround(burningCol, burningRow)
     local g = self.grid
-
     for row = 1, g.rows do
         for col = 1, g.cols do
-            if g:tileDistance(burningTile.col, burningTile.row, col, row) <= radius then
+            if g:tileDistance(burningCol, burningRow, col, row) <= NEIGHBOR_RADIUS then
                 local tile = g:getTile(col, row)
                 if tile and tile.mat.flammable
                    and tile.burnState == g.BURN_STATE.INTACT
-                   and tile.occupants and tile.occupants > 0
+                   and (tile.occupants or 0) > 0
                 then
                     local nkey = tileKey(col, row)
-                    if not self.spawnedOccupants[nkey] then
-                        -- Spawn as neighbor (delayed, calmer)
+                    -- Don't double-spawn from tiles that are already occupied/burning
+                    if not self.occupantSpawned[nkey] and not self.neighborSpawned[nkey] then
                         if #self.npcs < NPC_CAP then
                             local cx, cy = g:tileCenter(col, row)
-                            local npc = NPC.new("neighbor", cx, cy, g, self.fire)
-                            table.insert(self.npcs, npc)
+                            table.insert(self.npcs, NPC.new("neighbor", cx, cy, g, self.fire))
                         end
                     end
                 end
@@ -86,74 +118,42 @@ function Defenders:spawnNeighbors(burningTile)
     end
 end
 
--- ── Bucket chain self-organization ────────────────────────────────────────
--- When 3+ NPCs are near the same water source, they automatically chain.
--- Called each update; cheap because NPC count is capped.
+-- ── Bucket chain detection ────────────────────────────────────────────────
+-- Group NPCs by their current water target. Groups of CHAIN_THRESHOLD+
+-- set inChain = true on each member for the boosted douse rate.
+
 function Defenders:updateBucketChains()
-    -- TODO: group NPCs by nearest water source tile,
-    -- if group size >= BUCKET_CHAIN_COUNT, set chain=true on each member.
-    -- Chained NPCs get a dousing bonus and don't individually path to fire.
+    -- Group NPCs by water destination (coarse bucketing)
+    local groups = {}
+    for _, npc in ipairs(self.npcs) do
+        local wk = waterKey(npc.waterX, npc.waterY)
+        groups[wk] = groups[wk] or {}
+        table.insert(groups[wk], npc)
+    end
+
+    -- Apply / remove chain flag
+    for _, group in pairs(groups) do
+        local inChain = #group >= CHAIN_THRESHOLD
+        for _, npc in ipairs(group) do
+            npc.inChain = inChain
+        end
+    end
 end
 
--- ── Fire truck ────────────────────────────────────────────────────────────
+-- ── Fire truck escalation ─────────────────────────────────────────────────
+
 function Defenders:trySpawnTruck(runTimer)
     if self.truckSpawned then return end
 
-    local burnPct = self.grid:percentBurned()
     -- Delay shortens as more of the town burns
-    local delay = FIRETRUCK_DELAY - (burnPct / 100) * (FIRETRUCK_DELAY - FIRETRUCK_DELAY_MIN)
-    delay = math.max(FIRETRUCK_DELAY_MIN, delay)
+    local burnPct = self.grid:percentBurned()
+    local t = TRUCK_DELAY - (burnPct / 100) * (TRUCK_DELAY - TRUCK_DELAY_MIN)
+    t = math.max(TRUCK_DELAY_MIN, t)
 
-    if runTimer >= delay then
+    if runTimer >= t then
         self.truckSpawned = true
-        -- TODO: spawn fire truck entity at map edge, path to fire
-        -- self.trucks[#self.trucks+1] = FireTruck.new(...)
+        table.insert(self.trucks, FireTruck.new(self.grid, self.fire))
     end
 end
 
--- ── Update ────────────────────────────────────────────────────────────────
-
-function Defenders:update(dt, runTimer)
-    self.runTimer = runTimer
-
-    -- Check for newly burning tiles to trigger occupant spawns
-    local g = self.grid
-    local fc, fr = self.fire:getPosition()
-    local burningTile = g:getTile(fc, fr)
-    if burningTile and burningTile.burnState == g.BURN_STATE.BURNING then
-        self:spawnOccupants(burningTile)
-    end
-
-    -- Trigger neighbor response after delay
-    if runTimer >= NEIGHBOR_DELAY and burningTile
-       and burningTile.burnState == g.BURN_STATE.BURNING then
-        self:spawnNeighbors(burningTile)
-    end
-
-    -- Fire truck escalation
-    self:trySpawnTruck(runTimer)
-
-    -- Bucket chain check
-    self:updateBucketChains()
-
-    -- Update each NPC; remove dead/fled ones
-    local alive = {}
-    for _, npc in ipairs(self.npcs) do
-        npc:update(dt)
-        if not npc.done then
-            table.insert(alive, npc)
-        end
-    end
-    self.npcs = alive
-end
-
--- ── Rendering ─────────────────────────────────────────────────────────────
-
-function Defenders:draw()
-    for _, npc in ipairs(self.npcs) do
-        npc:draw()
-    end
-    -- TODO: draw fire trucks
-end
-
-return Defenders
+-- ── Update ──�
