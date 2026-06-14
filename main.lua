@@ -4,11 +4,11 @@ local StateManager = require("src.states.statemanager")
 local sm
 
 function love.load()
+    -- Pixel-perfect rendering
     love.graphics.setDefaultFilter("nearest", "nearest")
-    math.randomseed(os.time())   -- shuffle varies each run
 
     sm = StateManager.new()
-    sm:push("run")   -- push "menu" when menu is ready
+    sm:push("run")   -- skip menu for MVP; push "menu" when ready
 end
 
 function love.update(dt)

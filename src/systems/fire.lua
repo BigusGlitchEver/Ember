@@ -1,24 +1,37 @@
 -- fire.lua
 -- The ember: the player-controlled fire.
--- No auto-spread — every building that burns is one the player hopped to.
+-- Owns: current tile, Fire Level, Intensity, Heat, hopping logic.
+-- No auto-spread — every burning tile is one the player hopped to.
 
 local FIRE_LEVEL_MAX = 3
 
--- Chebyshev hop range per Fire Level
+-- How far (Chebyshev tiles) the ember can hop at each level
 local HOP_RANGE = { [1]=2, [2]=3, [3]=5 }
 
--- Burn speed multiplier per Fire Level (higher = faster burn)
-local BURN_SPEED = { [1]=1.0, [2]=1.5, [3]=2.2 }
+-- Burn speed multiplier per Fire Level (higher = burns through faster)
+local BURN_SPEED = { [1]=1.5, [2]=2.5, [3]=4.0 }
 
--- Intensity drain/restore rates (per second)
-local AMBIENT_DRAIN = 2.0   -- fire always hungers; drains while idle (between burns)
-local BURN_RESTORE  = 6.0   -- restored while actively burning a building
+-- Intensity drain/restore rates
+local AMBIENT_DRAIN = 3.0   -- lost per second always
+local BURN_RESTORE  = 9.0   -- gained per second while burning a building
 
 local INTENSITY_MAX = 100.0
 
--- Starting tile
+-- Starting position — a house so level can immediately begin climbing
 local START_COL = 2
 local START_ROW = 2
+
+-- Directional hop: map key → (dx, dy) in tile space
+local DIR = {
+    right = { 1,  0},
+    d     = { 1,  0},
+    left  = {-1,  0},
+    a     = {-1,  0},
+    up    = { 0, -1},
+    w     = { 0, -1},
+    down  = { 0,  1},
+    s     = { 0,  1},
+}
 
 local Fire = {}
 Fire.__index = Fire
@@ -27,7 +40,6 @@ function Fire.new(grid)
     local self = setmetatable({}, Fire)
     self.grid         = grid
     self.level        = 1
-    self.entryLevel   = 1   -- Fire Level at the moment of the last hop
     self.intensity    = INTENSITY_MAX
     self.intensityMax = INTENSITY_MAX
     self.heat         = 0
@@ -38,38 +50,30 @@ function Fire.new(grid)
     self.hopTimer     = 0
 
     self.burnTimer    = 0
-    self.burnDurCached = 0   -- computed once per building at hop time
     self.burning      = false
-    self.currentTile  = nil
 
-    self.upgrades     = {}
     self.hopTargets   = {}
+    self.hoveredCol   = nil
+    self.hoveredRow   = nil
 
-    -- Ignite starting tile
     local startTile = grid:getTile(START_COL, START_ROW)
     if startTile then
         grid:igniteTile(startTile)
-        self.burning       = true
-        self.currentTile   = startTile
-        self.entryLevel    = 1
-        self.burnDurCached = self:_calcBurnDuration(startTile, 1)
+        self.burning     = true
+        self.currentTile = startTile
     end
 
     return self
 end
 
--- ── Internal helpers ──────────────────────────────────────────────────────
-
--- Burn duration for a tile given a specific entry level (cached at hop time)
-function Fire:_calcBurnDuration(tile, lvl)
-    return tile.mat.burnDuration / BURN_SPEED[lvl]
-end
+-- ── Hop range ─────────────────────────────────────────────────────────────
 
 function Fire:hopRange()
-    return HOP_RANGE[self.level] + (self.upgrades.longJump and 1 or 0)
+    return HOP_RANGE[self.level]
 end
 
--- ── Hop target computation ────────────────────────────────────────────────
+-- ── Valid hop targets ──────────────────────────────────────────────────────
+
 function Fire:computeHopTargets()
     self.hopTargets = {}
     local range = self:hopRange()
@@ -98,6 +102,7 @@ function Fire:isValidTarget(col, row)
 end
 
 -- ── Hopping ───────────────────────────────────────────────────────────────
+
 function Fire:tryHop(px, py)
     if self.hopping then return end
     local col, row = self.grid:pixelToTile(px, py)
@@ -105,88 +110,105 @@ function Fire:tryHop(px, py)
     self:doHop(col, row)
 end
 
+-- Directional hop: find the valid target best aligned with (dx, dy)
+function Fire:tryHopDirection(dx, dy)
+    if self.hopping then return end
+    if #self.hopTargets == 0 then return end
+
+    local best      = nil
+    local bestScore = -math.huge
+
+    for _, tile in ipairs(self.hopTargets) do
+        local tc  = tile.col - self.col
+        local tr  = tile.row - self.row
+        local len = math.sqrt(tc * tc + tr * tr)
+        if len > 0 then
+            -- dot product with direction (cosine similarity)
+            local dot   = (tc * dx + tr * dy) / len
+            -- penalise distant tiles slightly so nearby wins ties
+            local score = dot - len * 0.05
+            if score > bestScore then
+                bestScore = score
+                best      = tile
+            end
+        end
+    end
+
+    -- Only hop if the best target is roughly in the right direction (dot > 0.3)
+    if best and bestScore > 0.3 then
+        self:doHop(best.col, best.row)
+    end
+end
+
 function Fire:doHop(col, row)
-    -- Level cost (floor 1)
-    local newLevel  = math.max(1, self.level - 1)
-    self.level      = newLevel
-    self.entryLevel = newLevel
+    -- Ash the tile we're leaving (ember IS the fire; without it the building is done)
+    if self.currentTile and self.currentTile.burnState == self.grid.BURN_STATE.BURNING then
+        self.grid:ashTile(self.currentTile)
+    end
 
-    -- Leave old tile burning visually (it will ash when finished via burnTimer in future)
-    -- For Phase 1: old tile just keeps its burn state; only one active ember
+    -- Level drops by 1 on every hop (floor 1)
+    self.level = math.max(1, self.level - 1)
 
-    -- Move
-    self.col  = col
-    self.row  = row
-    self.currentTile   = self.grid:getTile(col, row)
-    self.burnTimer     = 0
-    self.burnDurCached = self:_calcBurnDuration(self.currentTile, self.entryLevel)
-    self.burning       = true
+    self.col         = col
+    self.row         = row
+    self.currentTile = self.grid:getTile(col, row)
+    self.burnTimer   = 0
+    self.burning     = true
 
     self.grid:igniteTile(self.currentTile)
 
-    -- Hop animation
     self.hopping  = true
     self.hopTimer = 0.12
 end
 
--- ── Level growth during burn ──────────────────────────────────────────────
--- Divide the building's burn time into equal segments per level step.
--- entryLevel + earned steps = current level.
--- Example: mansion (cap=3), entry=1 → 2 steps, each at 50% of burn time.
---   0–49%  → level 1
---   50–99% → level 2
---   100%   → level 3 (set in onBuildingFinished)
-function Fire:updateLevelFromBurn()
-    if not self.currentTile then return end
-    local cap   = self.currentTile.mat.levelCap
-    local steps = cap - self.entryLevel
-    if steps <= 0 then return end   -- building can't grow us further
+-- ── Burn progress ──────────────────────────────────────────────────────────
 
-    local dur = self.burnDurCached
-    if dur <= 0 then return end
-
-    local progress    = math.min(0.999, self.burnTimer / dur)  -- cap just below 1.0; 1.0 handled by finish
-    local stepsEarned = math.floor(progress * steps)
-    self.level        = math.min(FIRE_LEVEL_MAX, self.entryLevel + stepsEarned)
+function Fire:burnDuration(tile)
+    return tile.mat.burnDuration / BURN_SPEED[self.level]
 end
 
--- ── Building finish ───────────────────────────────────────────────────────
 function Fire:onBuildingFinished()
     local tile = self.currentTile
     if not tile then return end
 
-    -- Award Heat
     self.heat = self.heat + tile.mat.heat
-
-    -- Climb to cap on completion
-    self.level = math.min(FIRE_LEVEL_MAX, tile.mat.levelCap)
-
-    -- Backdraft upgrade
-    if self.upgrades.backdraft then
-        self.intensity = math.min(self.intensityMax, self.intensity + 20)
-    end
-
     self.grid:ashTile(tile)
-    self.burning     = false
-    self.currentTile = nil
+    self.burning = false
+end
+
+-- Level climbs toward building's cap using a sqrt curve for fast early gain
+function Fire:updateLevelFromBurn()
+    if not self.currentTile then return end
+    local cap = self.currentTile.mat.levelCap
+    if cap <= self.level then return end
+
+    local duration = self:burnDuration(self.currentTile)
+    if duration <= 0 then return end
+
+    -- sqrt makes level climb fast early in the burn
+    local progress = math.sqrt(math.min(1.0, self.burnTimer / duration))
+    local target   = self.level + math.floor(progress * (cap - self.level) + 0.5)
+    target = math.min(cap, math.max(self.level, target))
+    self.level = math.min(FIRE_LEVEL_MAX, target)
 end
 
 -- ── Intensity ─────────────────────────────────────────────────────────────
+
 function Fire:drainIntensity(dt)
+    self.intensity = self.intensity - AMBIENT_DRAIN * dt
     if self.burning then
         self.intensity = self.intensity + BURN_RESTORE * dt
-    else
-        self.intensity = self.intensity - AMBIENT_DRAIN * dt
     end
     self.intensity = math.max(0, math.min(self.intensityMax, self.intensity))
 end
 
 function Fire:douse(amount)
     local resistance = 0.25 * (self.level - 1)
-    self.intensity   = math.max(0, self.intensity - amount * (1 - resistance))
+    self.intensity = math.max(0, self.intensity - amount * (1 - resistance))
 end
 
 -- ── Update ────────────────────────────────────────────────────────────────
+
 function Fire:update(dt)
     if self.hopping then
         self.hopTimer = self.hopTimer - dt
@@ -196,7 +218,8 @@ function Fire:update(dt)
     if self.burning and self.currentTile then
         self.burnTimer = self.burnTimer + dt
         self:updateLevelFromBurn()
-        if self.burnTimer >= self.burnDurCached then
+
+        if self.burnTimer >= self:burnDuration(self.currentTile) then
             self:onBuildingFinished()
         end
     end
@@ -205,59 +228,53 @@ function Fire:update(dt)
     self:computeHopTargets()
 end
 
-function Fire:keypressed(key) end
+-- ── Input ─────────────────────────────────────────────────────────────────
+
+function Fire:keypressed(key)
+    local dir = DIR[key]
+    if dir then
+        self:tryHopDirection(dir[1], dir[2])
+    end
+end
 
 -- ── Rendering ─────────────────────────────────────────────────────────────
-function Fire:draw()
-    local g  = self.grid
-    local ox = g.offsetX
-    local oy = g.offsetY
 
+function Fire:draw()
     -- Hop target highlights
     for _, tile in ipairs(self.hopTargets) do
-        local px, py = g:tileToPixel(tile.col, tile.row)
+        local px, py = self.grid:tileToPixel(tile.col, tile.row)
         love.graphics.setColor(1, 0.7, 0.2, 0.30)
-        love.graphics.rectangle("fill", px, py, g.TILE_W - 1, g.TILE_H - 1)
-        love.graphics.setColor(1, 0.55, 0.05, 0.85)
-        love.graphics.rectangle("line", px, py, g.TILE_W - 1, g.TILE_H - 1)
+        love.graphics.rectangle("fill", px, py, self.grid.TILE_W - 1, self.grid.TILE_H - 1)
+        love.graphics.setColor(1, 0.5, 0.1, 0.75)
+        love.graphics.rectangle("line", px, py, self.grid.TILE_W - 1, self.grid.TILE_H - 1)
     end
 
-    -- Ember circle (grows with level)
-    if self.currentTile or not self.burning then
-        local cx, cy = g:tileCenter(self.col, self.row)
-        local r = 6 + self.level * 5
-        -- Outer glow
-        love.graphics.setColor(1.0, 0.6, 0.1, 0.30)
-        love.graphics.circle("fill", cx, cy, r * 1.6)
-        -- Main body
-        love.graphics.setColor(1.0, 0.85, 0.25, 1)
-        love.graphics.circle("fill", cx, cy, r)
-        -- Hot core
-        love.graphics.setColor(1.0, 1.0, 0.8, 0.9)
-        love.graphics.circle("fill", cx, cy, r * 0.45)
-    end
-
-    -- Burn progress arc on current tile
-    if self.burning and self.currentTile and self.burnDurCached > 0 then
-        local cx, cy  = g:tileCenter(self.col, self.row)
-        local progress = math.min(1.0, self.burnTimer / self.burnDurCached)
-        love.graphics.setColor(1, 0.4, 0.0, 0.5)
-        love.graphics.arc("fill", cx, cy, g.TILE_W * 0.4,
-            -math.pi/2, -math.pi/2 + progress * math.pi * 2)
+    -- Ember on current tile
+    if self.currentTile then
+        local cx, cy = self.grid:tileCenter(self.col, self.row)
+        local radius = 8 + self.level * 4
+        love.graphics.setColor(1.0, 0.9, 0.3, 1)
+        love.graphics.circle("fill", cx, cy, radius)
+        love.graphics.setColor(1.0, 0.4, 0.0, 0.7)
+        love.graphics.circle("fill", cx, cy, radius * 0.6)
     end
 
     love.graphics.setColor(1, 1, 1, 1)
 end
 
 -- ── Accessors ─────────────────────────────────────────────────────────────
-function Fire:getLevel()     return self.level      end
-function Fire:getIntensity() return self.intensity  end
-function Fire:getHeat()      return self.heat       end
-function Fire:getPosition()  return self.col, self.row end
+
+function Fire:getLevel()      return self.level       end
+function Fire:getIntensity()  return self.intensity   end
+function Fire:getHeat()       return self.heat        end
+function Fire:getPosition()   return self.col, self.row end
 
 function Fire:getPowerFill()
-    if not self.burning or self.burnDurCached <= 0 then return 0 end
-    return math.min(1.0, self.burnTimer / self.burnDurCached)
+    if not self.currentTile or not self.burning then return 0 end
+    local duration = self:burnDuration(self.currentTile)
+    if duration <= 0 then return 1 end
+    return math.min(1.0, self.burnTimer / duration)
 end
 
 return Fire
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
